@@ -16,6 +16,9 @@ npm-debug.log*
 
 # Build output
 build/*.txt
+.next/
+.dist/
+output/
 
 design-artifacts/
 
