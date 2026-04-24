@@ -1,50 +1,20 @@
 const path = require('node:path');
 const os = require('node:os');
-const fs = require('fs-extra');
+const fs = require('./fs-native');
 const { CLIUtils } = require('./cli-utils');
 const { ExternalModuleManager } = require('./modules/external-manager');
-const { getProjectRoot } = require('./project-root');
+const { resolveModuleVersion } = require('./modules/version-resolver');
+const { parseChannelOptions, buildPlan, orphanPinWarnings, bundledTargetWarnings } = require('./modules/channel-plan');
 const prompts = require('./prompts');
 
 /**
- * Read module version from .claude-plugin/marketplace.json
+ * Read a module version from the freshest local metadata available.
  * @param {string} moduleCode - Module code (e.g., 'core', 'bmm', 'cis')
  * @returns {string} Version string or empty string
  */
-async function getMarketplaceVersion(moduleCode) {
-  let marketplacePath;
-  if (moduleCode === 'core' || moduleCode === 'bmm') {
-    marketplacePath = path.join(getProjectRoot(), '.claude-plugin', 'marketplace.json');
-  } else {
-    const cacheDir = path.join(os.homedir(), '.bmad', 'cache', 'external-modules', moduleCode);
-    marketplacePath = path.join(cacheDir, '.claude-plugin', 'marketplace.json');
-  }
-  try {
-    if (await fs.pathExists(marketplacePath)) {
-      const data = JSON.parse(await fs.readFile(marketplacePath, 'utf8'));
-      return _extractMarketplaceVersion(data);
-    }
-  } catch {
-    // ignore
-  }
-  return '';
-}
-
-/**
- * Extract the highest version from marketplace.json plugins array.
- * Handles multiple plugins per file safely.
- * @param {Object} data - Parsed marketplace.json
- * @returns {string} Version string or empty string
- */
-function _extractMarketplaceVersion(data) {
-  const plugins = data?.plugins;
-  if (!Array.isArray(plugins) || plugins.length === 0) return '';
-  // Use the highest version across all plugins in the file
-  let best = '';
-  for (const p of plugins) {
-    if (p.version && (!best || p.version > best)) best = p.version;
-  }
-  return best;
+async function getModuleVersion(moduleCode) {
+  const versionInfo = await resolveModuleVersion(moduleCode);
+  return versionInfo.version || '';
 }
 
 /**
@@ -63,6 +33,13 @@ class UI {
     const { MessageLoader } = require('./message-loader');
     const messageLoader = new MessageLoader();
     await messageLoader.displayStartMessage();
+
+    // Parse channel flags (--channel/--all-*/--next=/--pin) once. Warnings
+    // are surfaced immediately so the user sees them before any git ops run.
+    const channelOptions = parseChannelOptions(options);
+    for (const warning of channelOptions.warnings) {
+      await prompts.log.warn(warning);
+    }
 
     // Get directory from options or prompt
     let confirmedDirectory;
@@ -183,10 +160,38 @@ class UI {
           selectedModules.unshift('core');
         }
 
+        // For existing installs, resolve per-module update decisions BEFORE
+        // we clone anything. Reads the existing manifest's recorded channel
+        // per module and prompts the user on available upgrades (patch/minor
+        // default Y, major default N). Legacy entries with no channel are
+        // migrated here too. Mutates channelOptions.pins to lock rejections.
+        await this._resolveUpdateChannels({
+          bmadDir,
+          selectedModules,
+          channelOptions,
+          yes: options.yes || false,
+        });
+
         // Get tool selection
         const toolSelection = await this.promptToolSelection(confirmedDirectory, options);
 
-        const moduleConfigs = await this.collectModuleConfigs(confirmedDirectory, selectedModules, options);
+        const moduleConfigs = await this.collectModuleConfigs(confirmedDirectory, selectedModules, {
+          ...options,
+          channelOptions,
+        });
+
+        // Warn about --pin/--next flags that refer to modules the user didn't
+        // select, or that target bundled modules (core/bmm) where channel
+        // flags don't apply.
+        {
+          const bundledCodes = await this._bundledModuleCodes();
+          for (const warning of [
+            ...orphanPinWarnings(channelOptions, selectedModules),
+            ...bundledTargetWarnings(channelOptions, bundledCodes),
+          ]) {
+            await prompts.log.warn(warning);
+          }
+        }
 
         return {
           actionType: 'update',
@@ -197,6 +202,7 @@ class UI {
           coreConfig: moduleConfigs.core || {},
           moduleConfigs: moduleConfigs,
           skipPrompts: options.yes || false,
+          channelOptions,
         };
       }
     }
@@ -236,8 +242,31 @@ class UI {
     if (!selectedModules.includes('core')) {
       selectedModules.unshift('core');
     }
+
+    // Interactive channel gate: "Ready to install (all stable)? [Y/n]"
+    // Only shown for fresh installs with no channel flags and an external module
+    // selected. Non-interactive installs skip this and fall through to the
+    // registry default (stable) or whatever flags were supplied.
+    await this._interactiveChannelGate({ options, channelOptions, selectedModules });
+
     let toolSelection = await this.promptToolSelection(confirmedDirectory, options);
-    const moduleConfigs = await this.collectModuleConfigs(confirmedDirectory, selectedModules, options);
+    const moduleConfigs = await this.collectModuleConfigs(confirmedDirectory, selectedModules, {
+      ...options,
+      channelOptions,
+    });
+
+    // Warn about --pin/--next flags that refer to modules the user didn't
+    // select, or that target bundled modules (core/bmm) where channel
+    // flags don't apply.
+    {
+      const bundledCodes = await this._bundledModuleCodes();
+      for (const warning of [
+        ...orphanPinWarnings(channelOptions, selectedModules),
+        ...bundledTargetWarnings(channelOptions, bundledCodes),
+      ]) {
+        await prompts.log.warn(warning);
+      }
+    }
 
     return {
       actionType: 'install',
@@ -248,6 +277,7 @@ class UI {
       coreConfig: moduleConfigs.core || {},
       moduleConfigs: moduleConfigs,
       skipPrompts: options.yes || false,
+      channelOptions,
     };
   }
 
@@ -519,7 +549,7 @@ class UI {
    */
   async collectModuleConfigs(directory, modules, options = {}) {
     const { OfficialModules } = require('./modules/official-modules');
-    const configCollector = new OfficialModules();
+    const configCollector = new OfficialModules({ channelOptions: options.channelOptions });
 
     // Seed core config from CLI options if provided
     if (options.userName || options.communicationLanguage || options.documentOutputLanguage || options.outputFolder) {
@@ -598,7 +628,7 @@ class UI {
     const officialCodes = new Set(officialSelected);
     const externalManager = new ExternalModuleManager();
     const registryModules = await externalManager.listAvailable();
-    const officialRegistryCodes = new Set(registryModules.map((m) => m.code));
+    const officialRegistryCodes = new Set(['core', 'bmm', ...registryModules.map((m) => m.code)]);
     const installedNonOfficial = [...installedModuleIds].filter((id) => !officialRegistryCodes.has(id));
 
     // Phase 2: Community modules (category drill-down)
@@ -630,6 +660,11 @@ class UI {
    * @returns {Array} Selected official module codes
    */
   async _selectOfficialModules(installedModuleIds = new Set()) {
+    // Built-in modules (core, bmm) come from local source, not the registry
+    const { OfficialModules } = require('./modules/official-modules');
+    const builtInModules = (await new OfficialModules().listAvailable()).modules || [];
+
+    // External modules come from the registry (with fallback)
     const externalManager = new ExternalModuleManager();
     const registryModules = await externalManager.listAvailable();
 
@@ -637,20 +672,34 @@ class UI {
     const initialValues = [];
     const lockedValues = ['core'];
 
-    const buildModuleEntry = async (mod) => {
-      const isInstalled = installedModuleIds.has(mod.code);
-      const version = await getMarketplaceVersion(mod.code);
-      const label = version ? `${mod.name} (v${version})` : mod.name;
+    const buildModuleEntry = async (code, name, description, isDefault) => {
+      const isInstalled = installedModuleIds.has(code);
+      const version = await getModuleVersion(code);
+      const label = version ? `${name} (v${version})` : name;
       return {
         label,
-        value: mod.code,
-        hint: mod.description,
-        selected: isInstalled,
+        value: code,
+        hint: description,
+        selected: isInstalled || isDefault,
       };
     };
 
+    // Add built-in modules first (always available regardless of network)
+    const builtInCodes = new Set();
+    for (const mod of builtInModules) {
+      const code = mod.id;
+      builtInCodes.add(code);
+      const entry = await buildModuleEntry(code, mod.name, mod.description, mod.defaultSelected);
+      allOptions.push({ label: entry.label, value: entry.value, hint: entry.hint });
+      if (entry.selected) {
+        initialValues.push(code);
+      }
+    }
+
+    // Add external registry modules (skip built-in duplicates)
     for (const mod of registryModules) {
-      const entry = await buildModuleEntry(mod);
+      if (mod.builtIn || builtInCodes.has(mod.code)) continue;
+      const entry = await buildModuleEntry(mod.code, mod.name, mod.description, mod.defaultSelected);
       allOptions.push({ label: entry.label, value: entry.value, hint: entry.hint });
       if (entry.selected) {
         initialValues.push(mod.code);
@@ -1122,12 +1171,26 @@ class UI {
    * @returns {Array} Default module codes
    */
   async getDefaultModules(installedModuleIds = new Set()) {
+    // Built-in modules with default_selected come from local source
+    const { OfficialModules } = require('./modules/official-modules');
+    const builtInModules = (await new OfficialModules().listAvailable()).modules || [];
+
+    const defaultModules = [];
+    const seen = new Set();
+
+    for (const mod of builtInModules) {
+      if (mod.defaultSelected || installedModuleIds.has(mod.id)) {
+        defaultModules.push(mod.id);
+        seen.add(mod.id);
+      }
+    }
+
+    // Add external registry defaults
     const externalManager = new ExternalModuleManager();
     const registryModules = await externalManager.listAvailable();
 
-    const defaultModules = [];
-
     for (const mod of registryModules) {
+      if (mod.builtIn || seen.has(mod.code)) continue;
       if (mod.defaultSelected || installedModuleIds.has(mod.code)) {
         defaultModules.push(mod.code);
       }
@@ -1560,6 +1623,349 @@ class UI {
       return `  \u2022 ${name}${marker}`;
     });
     await prompts.log.message('Selected tools:\n' + toolLines.join('\n'));
+  }
+
+  /**
+   * Return the set of module codes the registry marks as built-in (core, bmm).
+   * These ship with the installer binary and have no per-module channel.
+   */
+  async _bundledModuleCodes() {
+    const externalManager = new ExternalModuleManager();
+    try {
+      const modules = await externalManager.listAvailable();
+      return modules.filter((m) => m.builtIn).map((m) => m.code);
+    } catch {
+      // Registry unreachable — fall back to the known bundled codes.
+      return ['core', 'bmm'];
+    }
+  }
+
+  /**
+   * Fast-path channel gate: confirm "all stable" or open the per-module picker.
+   *
+   * Skipped when:
+   *   - running non-interactively (--yes)
+   *   - the user already passed channel flags (--channel / --pin / --next)
+   *   - no externals/community modules are selected
+   *
+   * Mutates channelOptions.pins and channelOptions.nextSet to reflect picker choices.
+   */
+  async _interactiveChannelGate({ options, channelOptions, selectedModules }) {
+    if (options.yes) return;
+    // If the user already declared their channel intent via flags, trust them
+    // and skip the gate.
+    const haveFlagIntent = channelOptions.global || channelOptions.nextSet.size > 0 || channelOptions.pins.size > 0;
+    if (haveFlagIntent) return;
+
+    // Figure out which selected modules actually get a channel (externals +
+    // community modules). Bundled core/bmm and custom modules skip the picker.
+    const externalManager = new ExternalModuleManager();
+    const externals = await externalManager.listAvailable();
+    const externalByCode = new Map(externals.map((m) => [m.code, m]));
+
+    const { CommunityModuleManager } = require('./modules/community-manager');
+    const communityMgr = new CommunityModuleManager();
+    const community = await communityMgr.listAll();
+    const communityByCode = new Map(community.map((m) => [m.code, m]));
+
+    const channelSelectable = selectedModules.filter((code) => {
+      const info = externalByCode.get(code) || communityByCode.get(code);
+      return info && !info.builtIn;
+    });
+    if (channelSelectable.length === 0) return;
+
+    const fastPath = await prompts.confirm({
+      message: `Ready to install (all stable)? Pick "n" to customize channels or pin versions.`,
+      default: true,
+    });
+    if (fastPath) return; // stable for all, registry default applies
+
+    // Customize path: per-module picker.
+    const { fetchStableTags, parseGitHubRepo } = require('./modules/channel-resolver');
+
+    for (const code of channelSelectable) {
+      const info = externalByCode.get(code) || communityByCode.get(code);
+      const repoUrl = info.url;
+
+      // Try to pre-resolve the top stable tag so we can surface it in the picker.
+      let stableLabel = 'stable (released version)';
+      try {
+        const parsed = repoUrl ? parseGitHubRepo(repoUrl) : null;
+        if (parsed) {
+          const tags = await fetchStableTags(parsed.owner, parsed.repo);
+          if (tags.length > 0) {
+            stableLabel = `stable  ${tags[0].tag}  (released version)`;
+          }
+        }
+      } catch {
+        // fall through with the generic label
+      }
+
+      const choice = await prompts.select({
+        message: `${code}: choose a channel`,
+        choices: [
+          { name: stableLabel, value: 'stable' },
+          { name: 'next   (main HEAD \u2014 current development)', value: 'next' },
+          { name: 'pin    (specific version)', value: 'pin' },
+        ],
+        default: 'stable',
+      });
+
+      if (choice === 'next') {
+        channelOptions.nextSet.add(code);
+      } else if (choice === 'pin') {
+        const pinValue = await prompts.text({
+          message: `Enter a version tag for '${code}' (e.g. v1.6.0):`,
+          validate: (value) => {
+            if (!value || !/^[\w.\-+/]+$/.test(String(value).trim())) {
+              return 'Must be a non-empty tag name (letters, digits, dots, hyphens).';
+            }
+          },
+        });
+        channelOptions.pins.set(code, String(pinValue).trim());
+      }
+      // 'stable' is the default; nothing to record.
+    }
+  }
+
+  /**
+   * Resolve channel decisions for an update over an existing install.
+   *
+   * For each selected external/community module:
+   *   - Read the recorded channel from the existing manifest.
+   *   - On `stable`: query tags; if a newer stable exists, classify the diff
+   *     and prompt. Patch/minor default Y; major defaults N. `--yes` accepts
+   *     defaults (patches/minors) but NOT majors — a major under --yes stays
+   *     frozen unless the user also passes `--pin CODE=NEW_TAG`.
+   *   - On `next`: no prompt (pull HEAD).
+   *   - On `pinned`: no prompt (stays pinned).
+   *   - No channel recorded and `version: null`: one-time migration prompt
+   *     ("Switch to stable / Keep on next").
+   *
+   * Decisions that freeze the current version are applied by adding a pin to
+   * `channelOptions.pins` so downstream clone logic honors them.
+   */
+  async _resolveUpdateChannels({ bmadDir, selectedModules, channelOptions, yes }) {
+    const { Manifest } = require('./core/manifest');
+    const manifestObj = new Manifest();
+    const manifest = await manifestObj.read(bmadDir);
+    const existingByName = new Map();
+    for (const m of manifest?.modulesDetailed || []) {
+      if (m?.name) existingByName.set(m.name, m);
+    }
+    if (existingByName.size === 0) return;
+
+    const externalManager = new ExternalModuleManager();
+    const externals = await externalManager.listAvailable();
+    const externalByCode = new Map(externals.map((m) => [m.code, m]));
+
+    const { CommunityModuleManager } = require('./modules/community-manager');
+    const communityMgr = new CommunityModuleManager();
+    const community = await communityMgr.listAll();
+    const communityByCode = new Map(community.map((m) => [m.code, m]));
+
+    const { fetchStableTags, classifyUpgrade, releaseNotesUrl } = require('./modules/channel-resolver');
+    const { parseGitHubRepo } = require('./modules/channel-resolver');
+
+    // Interactive-only: offer a one-time gate to review / switch channels for
+    // selected modules that are already installed. Default N so normal Modify
+    // flows (add/remove modules) aren't interrupted.
+    let reviewChannels = false;
+    if (!yes) {
+      const existingWithChannel = selectedModules.filter((code) => {
+        const prev = existingByName.get(code);
+        if (!prev) return false;
+        const info = externalByCode.get(code) || communityByCode.get(code);
+        return info && !info.builtIn;
+      });
+      if (existingWithChannel.length > 0) {
+        reviewChannels = await prompts.confirm({
+          message: 'Review channel assignments (stable / next / pin) for your existing modules?',
+          default: false,
+        });
+      }
+    }
+
+    for (const code of selectedModules) {
+      const prev = existingByName.get(code);
+      if (!prev) continue;
+
+      const info = externalByCode.get(code) || communityByCode.get(code);
+      if (!info) continue;
+      // Bundled modules (core/bmm) ship with the installer binary itself —
+      // their version is stapled to the CLI version, not a git tag. Skip
+      // tag-API lookups for them; the "upgrade" mechanism is `npx bmad@X install`.
+      if (info.builtIn) continue;
+
+      const repoUrl = info.url;
+      const parsed = repoUrl ? parseGitHubRepo(repoUrl) : null;
+
+      // Legacy migration: manifest carries no channel and a null/empty
+      // version. Offer the one-time pick between stable and next.
+      const recordedChannel = prev.channel || null;
+      const needsMigration = !recordedChannel && (prev.version == null || prev.version === '');
+      if (needsMigration) {
+        if (yes) {
+          // Conservative headless default: stable.
+          continue;
+        }
+        const chosen = await prompts.select({
+          message: `${code}: your existing install tracks the main branch. Switch to stable releases (recommended for production), or keep on main?`,
+          choices: [
+            { name: 'Switch to stable', value: 'stable' },
+            { name: 'Keep on main (next)', value: 'next' },
+          ],
+          default: 'stable',
+        });
+        if (chosen === 'next') channelOptions.nextSet.add(code);
+        continue;
+      }
+
+      // Optional channel-switch offer. Fires only when the user opted in via
+      // the gate above. 'keep' falls through to the existing per-channel
+      // logic (which runs upgrade classification for stable). Any switch
+      // records the new intent into channelOptions and skips upgrade prompts.
+      if (reviewChannels && recordedChannel) {
+        const switchChoices = [
+          {
+            name: `Keep on '${recordedChannel}'${prev.version ? ` @ ${prev.version}` : ''}`,
+            value: 'keep',
+          },
+        ];
+        if (recordedChannel !== 'stable') {
+          switchChoices.push({ name: 'Switch to stable (released version)', value: 'stable' });
+        }
+        if (recordedChannel !== 'next') {
+          switchChoices.push({ name: 'Switch to next (main HEAD)', value: 'next' });
+        }
+        switchChoices.push({ name: 'Pin to a specific version tag', value: 'pin' });
+
+        const choice = await prompts.select({
+          message: `${code} channel:`,
+          choices: switchChoices,
+          default: 'keep',
+        });
+
+        if (choice === 'next') {
+          channelOptions.nextSet.add(code);
+          continue;
+        }
+        if (choice === 'pin') {
+          const pinValue = await prompts.text({
+            message: `Enter a version tag for '${code}' (e.g. v1.6.0):`,
+            validate: (value) => {
+              if (!value || !/^[\w.\-+/]+$/.test(String(value).trim())) {
+                return 'Must be a non-empty tag name (letters, digits, dots, hyphens).';
+              }
+            },
+          });
+          channelOptions.pins.set(code, String(pinValue).trim());
+          continue;
+        }
+        if (choice === 'stable') {
+          // Switch to stable: install at the top stable tag without an
+          // upgrade-classification prompt (the user explicitly opted in).
+          // Also warm the tag cache here so the actual clone step doesn't
+          // need a second GitHub API call (can hit rate limits).
+          if (parsed) {
+            try {
+              await fetchStableTags(parsed.owner, parsed.repo);
+            } catch {
+              // best effort; clone step will surface any failure
+            }
+          }
+          continue;
+        }
+        // 'keep' → fall through with recordedChannel below.
+      }
+
+      if (recordedChannel === 'pinned' || recordedChannel === 'next') {
+        // Respect any explicit channel intent the user already expressed via
+        // CLI flags (--channel / --all-* / --next=CODE / --pin CODE=TAG) or
+        // via the interactive review gate above. Only auto-re-assert the
+        // recorded channel when the user hasn't opted into anything else —
+        // otherwise --all-stable (or a review "switch to stable") would be
+        // silently clobbered by the prior channel.
+        const alreadyDecided = channelOptions.global || channelOptions.nextSet.has(code) || channelOptions.pins.has(code);
+        if (!alreadyDecided) {
+          if (recordedChannel === 'pinned' && prev.version) {
+            channelOptions.pins.set(code, prev.version);
+          } else if (recordedChannel === 'next') {
+            channelOptions.nextSet.add(code);
+          }
+        }
+        continue;
+      }
+
+      // Stable channel: check for a newer released tag.
+      if (!parsed) continue;
+      // Respect explicit CLI intent (--pin / --next=CODE / --all-*) and any
+      // choice the user already made in the earlier review gate. Without this
+      // guard the upgrade classifier below would unconditionally call
+      // `channelOptions.pins.set(code, prev.version)` on decline/major-refuse/
+      // fetch-error, silently clobbering the user's override.
+      const alreadyDecided = channelOptions.global || channelOptions.nextSet.has(code) || channelOptions.pins.has(code);
+      if (alreadyDecided) continue;
+      let tags;
+      try {
+        tags = await fetchStableTags(parsed.owner, parsed.repo);
+      } catch (error) {
+        await prompts.log.warn(`Could not check for updates on ${code} (${error.message}). Leaving at ${prev.version}.`);
+        if (prev.version) channelOptions.pins.set(code, prev.version);
+        continue;
+      }
+      if (!tags || tags.length === 0) continue;
+      const topTag = tags[0].tag; // e.g. "v1.7.0"
+      const currentTag = prev.version || '';
+      const diffClass = classifyUpgrade(currentTag, topTag);
+
+      if (diffClass === 'none') continue; // already at or above top tag
+
+      const notes = releaseNotesUrl(repoUrl, topTag);
+      let accept;
+      if (diffClass === 'major') {
+        if (yes) {
+          // Major under --yes is refused by design.
+          await prompts.log.warn(
+            `${code} ${currentTag} → ${topTag} is a new major release; staying on ${currentTag}. ` +
+              `To accept, rerun with --pin ${code}=${topTag}.`,
+          );
+          channelOptions.pins.set(code, currentTag);
+          continue;
+        }
+        accept = await prompts.confirm({
+          message:
+            `${code} ${topTag} available — new major release (may change behavior).` +
+            (notes ? ` Release notes: ${notes}.` : '') +
+            ' Upgrade?',
+          default: false,
+        });
+      } else if (diffClass === 'minor') {
+        if (yes) {
+          accept = true;
+        } else {
+          accept = await prompts.confirm({
+            message: `${code} ${topTag} available (new features).` + (notes ? ` Release notes: ${notes}.` : '') + ' Upgrade?',
+            default: true,
+          });
+        }
+      } else {
+        // patch
+        if (yes) {
+          accept = true;
+        } else {
+          accept = await prompts.confirm({
+            message: `${code} ${topTag} available. Upgrade?`,
+            default: true,
+          });
+        }
+      }
+
+      if (!accept && currentTag) {
+        // Freeze the current version by pinning it for this run.
+        channelOptions.pins.set(code, currentTag);
+      }
+    }
   }
 }
 
