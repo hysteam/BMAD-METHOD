@@ -15,7 +15,7 @@ Použijte příznaky příkazové řádky k neinteraktivní instalaci BMad. To j
 - Rychlé instalace se známými konfiguracemi
 
 :::note[Předpoklady]
-Vyžaduje [Node.js](https://nodejs.org) v20+ a `npx` (součástí npm).
+Vyžaduje [Node.js](https://nodejs.org) v20.12+ a `npx` (součástí npm).
 :::
 
 ## Dostupné příznaky
@@ -60,7 +60,7 @@ Dostupná ID nástrojů pro příznak `--tools`:
 
 **Preferované:** `claude-code`, `cursor`
 
-Spusťte `npx bmad-method install` interaktivně jednou pro zobrazení aktuálního seznamu podporovaných nástrojů, nebo zkontrolujte [konfiguraci kódů platforem](https://github.com/bmad-code-org/BMAD-METHOD/blob/main/tools/cli/installers/lib/ide/platform-codes.yaml).
+Spusťte `npx bmad-method install` interaktivně jednou pro zobrazení aktuálního seznamu podporovaných nástrojů, nebo zkontrolujte [konfiguraci kódů platforem](https://github.com/bmad-code-org/BMAD-METHOD/blob/main/tools/installer/ide/platform-codes.yaml).
 
 ## Režimy instalace
 
